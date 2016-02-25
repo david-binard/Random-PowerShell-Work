@@ -1,4 +1,4 @@
-﻿#Requires -Module ActiveDirectory
+#Requires -Module ActiveDirectory
 #Requires -Version 4
 
 <#	
@@ -6,18 +6,18 @@
 	This script finds all logon, logoff and total active session times of all users on all computers specified. For this script
 	to function as expected, the advanced AD policies; Audit Logon, Audit Logoff and Audit Other Logon/Logoff Events must be
 	enabled and targeted to the appropriate computers via GPO.
-
 .EXAMPLE
 	
 .PARAMETER ComputerName
 	If you don't have Active Directory and would just like to specify computer names manually use this parameter
-
 .INPUTS
 	None. You cannot pipe objects to Get-ActiveDirectoryUserActivity.ps1.
-
 .OUTPUTS
 	None. If successful, this script does not output anything.
 #>
+
+function Get-UserLogonSessionHistory {
+
 [CmdletBinding()]
 param
 (
@@ -29,7 +29,7 @@ param
 try
 {
 	
-	#region Defie all of the events to indicate session start or top
+	#region Define all of the events to indicate session start or top
 	$script:SessionEvents = @(
 		@{ 'Label' = 'Logon'; 'EventType' = 'SessionStart'; 'LogName' = 'Security'; 'ID' = 4624 } ## Advanced Audit Policy --> Audit Logon
 		@{ 'Label' = 'Logoff'; 'EventType' = 'SessionStop'; 'LogName' = 'Security'; 'ID' = 4647 } ## Advanced Audit Policy --> Audit Logoff
@@ -42,6 +42,7 @@ try
 	
 	$SessionStartIds = ($SessionEvents | where { $_.EventType -eq 'SessionStart' }).ID
 	## Startup ID will be used for events where the computer was powered off abruptly or crashes --not a great measurement
+	$SessionLockIds = ($SessionEvents | where { $_.Label -eq 'Locked' }).ID
 	$SessionStopIds = ($SessionEvents | where { $_.EventType -eq 'SessionStop' }).ID
 	#endregion
 	
@@ -56,7 +57,8 @@ try
 		$oSplit = $o.Split('/')
 		$dSplit = $oSplit[0].Split('.')
 		$oSplit = $oSplit[1..$oSplit.Length]
-		$ou = "OU=$([array]::Reverse($oSplit) -join ',OU='),DC=$($dSplit -join ',DC=')"
+		[array]::Reverse($oSplit)
+		$ou = "OU=$($oSplit -join ',OU='),DC=$($dSplit -join ',DC=')"
 		Write-Verbose -Message "Gathering up all computers in the [$($ou)] OU"
 		$computers = Get-ADComputer -SearchBase $ou -Filter { Enabled -eq $true }
 		foreach ($c in $computers)
@@ -76,12 +78,19 @@ try
 				$events = Get-WinEvent -ComputerName $computer -LogName $logNames -FilterXPath $xPath
 				Write-Verbose -Message "Found [$($events.Count)] events to look through"
 				
+				$SessionMostRecentStartEvent = $Events.where({
+					$_.ID -in $SessionStartIds
+				}) | select -First 1
 				$events.foreach({
 					if ($_.Id -in $SessionStartIds)
 					{
 						$logonEvtId = $_.Id
 						$xEvt = [xml]$_.ToXml()
 						$Username = ($xEvt.Event.EventData.Data | where { $_.Name -eq 'TargetUserName' }).'#text'
+						if (-not $Username)
+						{
+							$Username = ($xEvt.Event.EventData.Data | where { $_.Name -eq 'AccountName' }).'#text'
+						}
 						$LogonId = ($xEvt.Event.EventData.Data | where { $_.Name -eq 'TargetLogonId' }).'#text'
 						if (-not $LogonId)
 						{
@@ -90,18 +99,37 @@ try
 						$LogonTime = $_.TimeCreated
 						
 						Write-Verbose -Message "New session start event found: event ID [$($logonEvtId)] username [$($Username)] logonID [$($LogonId)] time [$($LogonTime)]"
+						$SessionLockEvent = $Events.where({
+							$_.TimeCreated -gt $LogonTime -and
+							$_.ID -in $SessionLockIds -and
+							(([xml]$_.ToXml()).Event.EventData.Data | where { $_.Name -eq 'TargetLogonId' }).'#text' -eq $LogonId
+						}) | select -Last 1
 						$SessionEndEvent = $Events.where({
 							$_.TimeCreated -gt $LogonTime -and
 							$_.ID -in $SessionStopIds -and
 							(([xml]$_.ToXml()).Event.EventData.Data | where { $_.Name -eq 'TargetLogonId' }).'#text' -eq $LogonId
 						}) | select -First 1
-						if (-not $SessionEndEvent) ## This be improved by seeing if this is the latest logon event
-						{
-							#Write-Verbose -Message "Could not find a session end event for logon ID [$($LogonId)]. Assuming most current"
-							Write-Warning "Could not find session end event"
-							#$LogoffTime = Get-Date
+						if ($SessionLockEvent -and $SessionLockEvent.TimeCreated -lt $SessionEndEvent.TimeCreated) {
+							$SessionEndEvent = $SessionLockEvent
 						}
-						else
+						if ($_ -eq $SessionMostRecentStartEvent)
+						{
+							$LogoffTime = Get-Date
+							Write-Verbose -Message "Session stop ID not found, this should be an active session"
+							$output = [ordered]@{
+								'ComputerName' = $_.MachineName
+								'Username' = $Username
+								'LogonID' = $LogonID
+								'StartTime' = $LogonTime
+								'StartAction' = $SessionEvents.where({ $_.ID -eq $logonEvtId }).Label
+								'StopTime' = ''
+								'StopAction' = ''
+								'Session Active (Days)' = [math]::Round((New-TimeSpan -Start $LogonTime -End $LogoffTime).TotalDays, 2)
+								'Session Active (Min)' = [math]::Round((New-TimeSpan -Start $LogonTime -End $LogoffTime).TotalMinutes, 2)
+							}
+							[pscustomobject]$output
+						}
+						elseif ($SessionEndEvent)
 						{
 							$LogoffTime = $SessionEndEvent.TimeCreated
 							Write-Verbose -Message "Session stop ID is [$($SessionEndEvent.Id)]"
@@ -109,6 +137,7 @@ try
 							$output = [ordered]@{
 								'ComputerName' = $_.MachineName
 								'Username' = $Username
+								'LogonID' = $LogonID
 								'StartTime' = $LogonTime
 								'StartAction' = $SessionEvents.where({ $_.ID -eq $logonEvtId }).Label
 								'StopTime' = $LogoffTime
@@ -123,7 +152,7 @@ try
 			}
 			catch
 			{
-				Write-Error $_.Exception.Message
+				#Write-Error $_.Exception.Message
 			}
 		}
 	}
@@ -131,4 +160,6 @@ try
 catch
 {
 	$PSCmdlet.ThrowTerminatingError($_)
+}
+
 }
